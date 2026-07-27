@@ -24,10 +24,18 @@ pub const Options = struct {
     purge: bool = true,
     /// Keep directories that ended up empty.
     emptydirs: bool = false,
+    /// Split detached debug symbols into a companion `-debug` package.
+    debug: bool = false,
 
-    /// Apply a PKGBUILD's `options=()` over the defaults.
+    /// Apply a PKGBUILD's `options=()` over the built-in defaults.
     pub fn fromSrcInfo(meta: *const srcinfo.SrcInfo) Options {
-        var o: Options = .{};
+        return overlay(.{}, meta);
+    }
+
+    /// Apply a PKGBUILD's `options=()` over an arbitrary base, so host-wide
+    /// settings from optimkp.toml can sit underneath.
+    pub fn overlay(base: Options, meta: *const srcinfo.SrcInfo) Options {
+        var o = base;
         inline for (@typeInfo(Options).@"struct".fields) |f| {
             if (f.type == bool) {
                 if (meta.option(f.name)) |set| @field(o, f.name) = set;
@@ -47,14 +55,21 @@ pub const Report = struct {
     stripped: usize = 0,
     removed: usize = 0,
     compressed: usize = 0,
+    /// Binaries whose symbols were split out into `debug_dir`.
+    detached: usize = 0,
 };
 
 /// Run every enabled cleanup over `pkgdir`.
+///
+/// When `debug_dir` is given and `opts.debug` is set, symbols are extracted
+/// there (under `usr/lib/debug/`) before stripping, so they can be shipped as
+/// a separate package.
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
     pkgdir: []const u8,
     opts: Options,
+    debug_dir: ?[]const u8,
 ) !Report {
     var report: Report = .{};
 
@@ -110,6 +125,11 @@ pub fn run(
             continue;
         }
         if (opts.strip and isElf(io, full)) {
+            if (opts.debug) {
+                if (detachSymbols(gpa, io, full, rel, debug_dir)) {
+                    report.detached += 1;
+                } else |_| {}
+            }
             // Best effort: a binary we cannot strip is not a build failure.
             exec.check(io, &.{ "strip", "--strip-unneeded", full }, .{}) catch {};
             report.stripped += 1;
@@ -162,6 +182,64 @@ fn pruneEmptyDirs(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !usize {
     }
 
     return removed;
+}
+
+/// Copy a binary's debug symbols into `debug_dir` and leave a `.gnu_debuglink`
+/// behind, so a debugger can find them once the original is stripped.
+fn detachSymbols(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    full: []const u8,
+    rel: []const u8,
+    debug_dir: ?[]const u8,
+) !void {
+    const root = debug_dir orelse return error.NoDebugDir;
+
+    const dest = try std.fmt.allocPrint(gpa, "{s}/usr/lib/debug/{s}.debug", .{ root, rel });
+    defer gpa.free(dest);
+
+    if (std.fs.path.dirname(dest)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+
+    try exec.check(io, &.{ "objcopy", "--only-keep-debug", full, dest }, .{});
+    try exec.check(io, &.{ "objcopy", "--add-gnu-debuglink", dest, full }, .{});
+}
+
+/// Copy the source tree into a debug package's `/usr/src/debug/<pkgbase>`.
+///
+/// Compiled output is skipped: `$srcdir` after a build holds both the sources
+/// and the binaries produced from them, and shipping the binaries again inside
+/// the debug package would roughly double it for no benefit. Detecting them by
+/// ELF magic avoids guessing from filenames.
+pub fn copyDebugSources(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    srcdir: []const u8,
+    dest: []const u8,
+) !void {
+    var src_dir = try std.Io.Dir.cwd().openDir(io, srcdir, .{ .iterate = true });
+    defer src_dir.close(io);
+
+    try std.Io.Dir.cwd().createDirPath(io, dest);
+    var dest_dir = try std.Io.Dir.cwd().openDir(io, dest, .{});
+    defer dest_dir.close(io);
+
+    var walker = try src_dir.walk(gpa);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+
+        const full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ srcdir, entry.path });
+        defer gpa.free(full);
+        if (isElf(io, full)) continue;
+
+        if (std.fs.path.dirname(entry.path)) |parent| {
+            dest_dir.createDirPath(io, parent) catch {};
+        }
+        src_dir.copyFile(entry.path, dest_dir, entry.path, io, .{}) catch {};
+    }
 }
 
 fn shouldPurge(rel: []const u8) bool {

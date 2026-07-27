@@ -10,7 +10,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 pass=0
 fail=0
-for script in "$HERE"/0*.sh; do
+for script in "$HERE"/[0-9][0-9]-*.sh; do
   name="$(basename "$script")"
   printf '\n=========== %s ===========\n' "$name"
   if bash "$script" >/tmp/opti-it.log 2>&1; then

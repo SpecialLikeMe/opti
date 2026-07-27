@@ -39,7 +39,7 @@ $OPTI build "$WORK"
 
 echo
 echo "=== .PKGINFO derived from the PKGBUILD alone ==="
-tar xzOf "$WORK"/bare-3.1.4-1-x86_64.pkg.tar.gz .PKGINFO
+tar xOf "$(ls "$WORK"/bare-3.1.4-1-x86_64.pkg.tar.*)" .PKGINFO
 
 echo "=== no stray generated file left behind ==="
 ls -a "$WORK" | grep -c 'opti-srcinfo' || echo "clean"
@@ -47,5 +47,5 @@ ls -a "$WORK" | grep -c 'opti-srcinfo' || echo "clean"
 echo
 echo "=== packaged binary runs ==="
 rm -rf /var/tmp/bare-v; mkdir -p /var/tmp/bare-v
-tar xzf "$WORK"/bare-3.1.4-1-x86_64.pkg.tar.gz -C /var/tmp/bare-v
+tar xf "$(ls "$WORK"/bare-3.1.4-1-x86_64.pkg.tar.*)" -C /var/tmp/bare-v
 /var/tmp/bare-v/usr/bin/bare

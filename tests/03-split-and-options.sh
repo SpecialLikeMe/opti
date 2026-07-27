@@ -60,36 +60,36 @@ $OPTI build "$WORK"
 
 echo
 echo "=== artifacts ==="
-ls -1 "$WORK"/*.pkg.tar.gz | xargs -n1 basename
+ls -1 "$WORK"/*.pkg.tar.* | xargs -n1 basename
 
-DEMO="$WORK/demo-1.2.3-2-x86_64.pkg.tar.gz"
+DEMO=$(ls "$WORK"/demo-1.2.3-2-x86_64.pkg.tar.*)
 echo
 echo "=== pkgver() overrode 9.9.9 -> 1.2.3 in the filename above ==="
 
 echo
 echo "=== .PKGINFO (demo) ==="
-tar xzOf "$DEMO" .PKGINFO
+tar xOf "$DEMO" .PKGINFO
 
 echo "=== .BUILDINFO present ==="
-tar xzOf "$DEMO" .BUILDINFO | head -6
+tar xOf "$DEMO" .BUILDINFO | head -6
 
 echo
 echo "=== .INSTALL scriptlet embedded ==="
-tar xzOf "$DEMO" .INSTALL
+tar xOf "$DEMO" .INSTALL
 
 echo "=== members ==="
-tar tzf "$DEMO"
+tar tf "$DEMO"
 
 echo
 echo "=== symlink preserved ==="
-tar tvzf "$DEMO" | grep 'demo-link'
+tar tvf "$DEMO" | grep 'demo-link'
 
 echo
 echo "=== options honoured ==="
-tar tzf "$DEMO" | grep -q 'libdemo.a' && echo "staticlibs=on : .a KEPT (correct)" || echo ".a removed (WRONG)"
-tar tzf "$DEMO" | grep -q 'libdemo.la' && echo ".la kept (WRONG)" || echo "libtool=off: .la removed (correct)"
-tar tzf "$DEMO" | grep -q 'demo.1.gz' && echo "man gzipped (WRONG, !zipman)" || echo "!zipman: man NOT gzipped (correct)"
+tar tf "$DEMO" | grep -q 'libdemo.a' && echo "staticlibs=on : .a KEPT (correct)" || echo ".a removed (WRONG)"
+tar tf "$DEMO" | grep -q 'libdemo.la' && echo ".la kept (WRONG)" || echo "libtool=off: .la removed (correct)"
+tar tf "$DEMO" | grep -q 'demo.1.gz' && echo "man gzipped (WRONG, !zipman)" || echo "!zipman: man NOT gzipped (correct)"
 
 echo
 echo "=== split package produced its own artifact ==="
-tar tzf "$WORK/demo-docs-1.2.3-2-x86_64.pkg.tar.gz" | grep 'README'
+tar tf "$(ls "$WORK"/demo-docs-1.2.3-2-x86_64.pkg.tar.*)" | grep 'README'

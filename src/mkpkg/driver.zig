@@ -10,8 +10,20 @@ const archive = @import("archive.zig");
 const lifecycle = @import("lifecycle.zig");
 const tidy = @import("tidy.zig");
 const generate = @import("generate.zig");
+const conf = @import("config.zig");
 
 pub const Error = error{ MissingPkgbuild, MissingSrcinfo };
+
+/// Per-invocation switches, mirroring makepkg's command line.
+pub const BuildOptions = struct {
+    /// `--nocheck`: skip `check()`, whose test suites are often the slowest
+    /// part of a build.
+    skip_check: bool = false,
+    /// `--skipchecksums`: accept sources without validating them.
+    skip_checksums: bool = false,
+    /// `--holdver`: do not run `pkgver()`, keeping the declared version.
+    hold_version: bool = false,
+};
 
 /// Layout of a build work tree, mirroring makepkg's.
 pub const Layout = struct {
@@ -44,6 +56,7 @@ pub fn build(
     out: *std.Io.Writer,
     startdir: []const u8,
     config_in: lifecycle.Config,
+    build_opts: BuildOptions,
 ) !void {
     const pre = lifecycle.preflight(io_ctx);
     if (!pre.ok()) {
@@ -59,11 +72,19 @@ pub fn build(
     if (!io.exists(io_ctx, layout.pkgbuild)) return Error.MissingPkgbuild;
 
     // Architecture, target triple and job count come from the machine rather
-    // than from hardcoded defaults.
+    // than from hardcoded defaults...
     var config = config_in;
     var host = try lifecycle.detectHost(gpa, io_ctx, startdir);
     defer host.deinit();
     host.applyTo(&config);
+
+    // ...and optimkp.toml overrides anything it chooses to specify.
+    var user_config = try conf.load(gpa, io_ctx, env, startdir);
+    defer user_config.deinit();
+    user_config.applyTo(&config);
+    if (user_config.found()) {
+        try out.print("using {s}\n", .{user_config.source_path});
+    }
 
     const meta_path = try std.fmt.allocPrint(gpa, "{s}/.SRCINFO", .{startdir});
     defer gpa.free(meta_path);
@@ -91,7 +112,15 @@ pub fn build(
     if (meta.sources.len > 0) {
         try out.writeAll("retrieving sources\n");
         try out.flush();
-        try sources.acquire(gpa, io_ctx, out, &meta, layout.startdir, layout.srcdir);
+        try sources.acquire(
+            gpa,
+            io_ctx,
+            out,
+            &meta,
+            layout.startdir,
+            layout.srcdir,
+            build_opts.skip_checksums,
+        );
     }
 
     var ctx: lifecycle.Context = .{
@@ -103,6 +132,7 @@ pub fn build(
         .pkgver = meta.pkgver,
         .pkgrel = meta.pkgrel,
         .config = config,
+        .flags = lifecycle.Flags.fromOptions(&meta),
     };
 
     // pkgver() runs after sources are in place: VCS packages derive their
@@ -110,7 +140,12 @@ pub fn build(
     const capture = try std.fmt.allocPrint(gpa, "{s}/.opti-pkgver", .{layout.startdir});
     defer gpa.free(capture);
 
-    if (try lifecycle.runPkgver(gpa, io_ctx, env, ctx, capture)) |derived| {
+    const derived_opt = if (build_opts.hold_version)
+        null
+    else
+        try lifecycle.runPkgver(gpa, io_ctx, env, ctx, capture);
+
+    if (derived_opt) |derived| {
         defer gpa.free(derived);
         gpa.free(version);
         version = if (meta.epoch) |e|
@@ -118,20 +153,35 @@ pub fn build(
         else
             try std.fmt.allocPrint(gpa, "{s}-{s}", .{ derived, meta.pkgrel });
         ctx.pkgver = derived;
+        lifecycle.writeBackPkgver(gpa, io_ctx, layout.pkgbuild, derived) catch {};
         try out.print("  pkgver: {s}\n", .{version});
     }
     io.removeTree(io_ctx, capture) catch {};
 
     inline for (.{ .prepare, .build, .check }) |stage| {
-        const outcome = try lifecycle.runStage(gpa, io_ctx, env, ctx, stage);
-        try out.print("  {s}: {s}\n", .{ @tagName(stage), @tagName(outcome) });
+        if (stage == .check and build_opts.skip_check) {
+            try out.writeAll("  check: skipped\n");
+        } else {
+            const outcome = try lifecycle.runStage(gpa, io_ctx, env, ctx, stage);
+            try out.print("  {s}: {s}\n", .{ @tagName(stage), @tagName(outcome) });
+        }
         try out.flush();
     }
 
-    const opts = tidy.Options.fromSrcInfo(&meta);
+    // Machine preferences first, then the PKGBUILD's own options=(), so a
+    // package always wins over a host-wide default.
+    var opts: tidy.Options = .{};
+    user_config.applyOptions(&opts);
+    opts = tidy.Options.overlay(opts, &meta);
+
+    const compression = user_config.compression orelse archive.Compression.preferred(io_ctx);
+    const level = user_config.compression_level orelse conf.default_level;
 
     for (meta.packages) |pkg| {
-        try packageOne(gpa, io_ctx, env, out, &meta, pkg, layout, &ctx, version, config, opts);
+        try packageOne(
+            gpa,   io_ctx, env,     out,  &meta, pkg,
+            layout, &ctx,  version, config, opts, compression, level,
+        );
     }
 }
 
@@ -148,6 +198,8 @@ fn packageOne(
     version: []const u8,
     config: lifecycle.Config,
     opts: tidy.Options,
+    compression: archive.Compression,
+    level: u8,
 ) !void {
     const pkgdir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ layout.pkgbase_dir, pkg.pkgname });
     defer gpa.free(pkgdir);
@@ -169,10 +221,20 @@ fn packageOne(
     try out.print("  package({s}): ran\n", .{pkg.pkgname});
     try out.flush();
 
-    const report = try tidy.run(gpa, io_ctx, pkgdir, opts);
+    // Debug symbols are staged separately so they can ship as their own
+    // package rather than bloating the main one.
+    const debug_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}-debug",
+        .{ layout.pkgbase_dir, pkg.pkgname },
+    );
+    defer gpa.free(debug_dir);
+    if (opts.debug) try io.makePath(io_ctx, debug_dir);
+
+    const report = try tidy.run(gpa, io_ctx, pkgdir, opts, if (opts.debug) debug_dir else null);
     try out.print(
-        "  tidy: {d} stripped, {d} removed, {d} compressed\n",
-        .{ report.stripped, report.removed, report.compressed },
+        "  tidy: {d} stripped, {d} removed, {d} compressed, {d} detached\n",
+        .{ report.stripped, report.removed, report.compressed, report.detached },
     );
 
     // The install= scriptlet lives next to the PKGBUILD and travels inside the
@@ -185,13 +247,30 @@ fn packageOne(
         script = io.readFile(io_ctx, gpa, path, .limited(1 << 20)) catch null;
     }
 
-    const bytes = try archive.build(gpa, io_ctx, pkgdir, .{
+    var changelog: ?[]u8 = null;
+    defer if (changelog) |cl| gpa.free(cl);
+    if (meta.changelog) |name| {
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ layout.startdir, name });
+        defer gpa.free(path);
+        changelog = io.readFile(io_ctx, gpa, path, .limited(1 << 20)) catch null;
+    }
+
+    const out_path = try std.fmt.allocPrint(gpa, "{s}/{s}-{s}-{s}{s}", .{
+        layout.startdir,
+        pkg.pkgname,
+        version,
+        meta.archFor(config.carch),
+        compression.extension(),
+    });
+    defer gpa.free(out_path);
+
+    const written = try archive.write(gpa, io_ctx, pkgdir, .{
         .pkgname = pkg.pkgname,
         .pkgbase = meta.pkgbase,
         .version = version,
         .pkgdesc = pkg.pkgdesc,
         .url = pkg.url,
-        .arch = config.carch,
+        .arch = meta.archFor(config.carch),
         .packager = config.packager,
         .builddate = @intCast(std.Io.Timestamp.now(io_ctx, .real).toSeconds()),
         .licenses = pkg.licenses,
@@ -200,21 +279,78 @@ fn packageOne(
         .conflicts = pkg.conflicts,
         .replaces = pkg.replaces,
         .backup = pkg.backup,
+        .optdepends = pkg.optdepends,
+        .groups = pkg.groups,
         .install_script = script,
+        .changelog = changelog,
         .options = meta.options,
-    }, .gzip, layout.startdir);
-    defer gpa.free(bytes);
+    }, compression, layout.startdir, out_path, level);
 
-    const out_path = try std.fmt.allocPrint(gpa, "{s}/{s}-{s}-{s}{s}", .{
+    try out.print("built {s} ({d} bytes)\n", .{ out_path, written });
+    try out.flush();
+
+    // makepkg's debug packages carry the sources the symbols refer to, so a
+    // debugger can show source lines and not just function names.
+    if (opts.debug and report.detached > 0) {
+        const src_dest = try std.fmt.allocPrint(
+            gpa,
+            "{s}/usr/src/debug/{s}",
+            .{ debug_dir, meta.pkgbase },
+        );
+        defer gpa.free(src_dest);
+        tidy.copyDebugSources(gpa, io_ctx, layout.srcdir, src_dest) catch {};
+    }
+
+    if (opts.debug and report.detached > 0) {
+        try emitDebugPackage(
+            gpa,       io_ctx,  out,     meta, pkg,
+            debug_dir, version, config,  compression, level, layout,
+        );
+    }
+}
+
+/// Package the detached symbols as `<pkgname>-debug`.
+fn emitDebugPackage(
+    gpa: std.mem.Allocator,
+    io_ctx: std.Io,
+    out: *std.Io.Writer,
+    meta: *const srcinfo.SrcInfo,
+    pkg: srcinfo.Package,
+    debug_dir: []const u8,
+    version: []const u8,
+    config: lifecycle.Config,
+    compression: archive.Compression,
+    level: u8,
+    layout: Layout,
+) !void {
+    const name = try std.fmt.allocPrint(gpa, "{s}-debug", .{pkg.pkgname});
+    defer gpa.free(name);
+
+    const desc = try std.fmt.allocPrint(gpa, "Detached debugging symbols for {s}", .{pkg.pkgname});
+    defer gpa.free(desc);
+
+    const path = try std.fmt.allocPrint(gpa, "{s}/{s}-{s}-{s}{s}", .{
         layout.startdir,
-        pkg.pkgname,
+        name,
         version,
-        config.carch,
-        archive.Compression.gzip.extension(),
+        meta.archFor(config.carch),
+        compression.extension(),
     });
-    defer gpa.free(out_path);
+    defer gpa.free(path);
 
-    try io.writeFile(io_ctx, out_path, bytes);
-    try out.print("built {s} ({d} bytes)\n", .{ out_path, bytes.len });
+    const written = try archive.write(gpa, io_ctx, debug_dir, .{
+        .pkgname = name,
+        .pkgbase = meta.pkgbase,
+        .version = version,
+        .pkgdesc = desc,
+        .url = pkg.url,
+        .arch = meta.archFor(config.carch),
+        .packager = config.packager,
+        .builddate = @intCast(std.Io.Timestamp.now(io_ctx, .real).toSeconds()),
+        .licenses = pkg.licenses,
+        .options = meta.options,
+    }, compression, layout.startdir, path, level);
+
+    try out.print("built {s} ({d} bytes)\n", .{ path, written });
     try out.flush();
 }

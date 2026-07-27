@@ -46,16 +46,16 @@ PKGEOF
 echo "=== build ==="
 $OPTI build "$WORK"
 
-PKG="$WORK/final-1.0-1-$(uname -m).pkg.tar.gz"
+PKG=$(ls "$WORK"/final-1.0-1-*.pkg.tar.*)
 echo
 echo "=== members ==="
-tar tzf "$PKG" | grep -v '^\.' | sort
+tar tf "$PKG" | grep -v '^\.' | sort
 
 echo
 echo "=== checks ==="
-tar tzf "$PKG" | grep -q 'empty-dir' && echo "FAIL: empty dir kept" || echo "ok: empty dirs pruned"
-tar tzf "$PKG" | grep -q 'man1/final.1.gz' && echo "ok: zipman compressed the man page" || echo "FAIL: man not gzipped"
-tar tzf "$PKG" | grep -q 'from-xz.txt' && echo "ok: xz source extracted" || echo "FAIL: xz"
+tar tf "$PKG" | grep -q 'empty-dir' && echo "FAIL: empty dir kept" || echo "ok: empty dirs pruned"
+tar tf "$PKG" | grep -q 'man1/final.1.gz' && echo "ok: zipman compressed the man page" || echo "FAIL: man not gzipped"
+tar tf "$PKG" | grep -q 'from-xz.txt' && echo "ok: xz source extracted" || echo "FAIL: xz"
 echo
 echo "=== .PKGINFO arch reflects detected host ==="
-tar xzOf "$PKG" .PKGINFO | grep '^arch'
+tar xOf "$PKG" .PKGINFO | grep '^arch'

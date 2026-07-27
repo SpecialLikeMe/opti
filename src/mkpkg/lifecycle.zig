@@ -72,6 +72,7 @@ pub const Context = struct {
     pkgrel: []const u8,
 
     config: Config = .{},
+    flags: Flags = .{},
 };
 
 /// Run one lifecycle stage. Returns `.absent` when the PKGBUILD does not
@@ -167,6 +168,64 @@ pub fn runPkgver(
     return try gpa.dupe(u8, trimmed);
 }
 
+/// Rewrite the `pkgver=` assignment in the PKGBUILD, as makepkg does after
+/// evaluating `pkgver()`. Without this the file on disk keeps claiming the
+/// stale version, and anything reading it afterwards disagrees with the
+/// artifact that was just produced.
+pub fn writeBackPkgver(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    pkgbuild: []const u8,
+    new_version: []const u8,
+) !void {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, pkgbuild, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var replaced = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.writer.writeByte('\n');
+        first = false;
+
+        // Only the top-level assignment, never the pkgver() function header.
+        if (!replaced and std.mem.startsWith(u8, line, "pkgver=")) {
+            try out.writer.print("pkgver={s}", .{new_version});
+            replaced = true;
+            continue;
+        }
+        try out.writer.writeAll(line);
+    }
+
+    if (!replaced) return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pkgbuild, .data = out.written() });
+}
+
+/// Build-flag switches driven by `options=()`.
+pub const Flags = struct {
+    /// `!buildflags` clears CFLAGS/CXXFLAGS/LDFLAGS entirely; some packages
+    /// miscompile with distro hardening applied.
+    buildflags: bool = true,
+    /// `lto` enables link-time optimisation; off by default, as in makepkg.
+    lto: bool = false,
+    /// `debug` adds debug info to the compiled output.
+    debug: bool = false,
+
+    pub fn fromOptions(meta: anytype) Flags {
+        var f: Flags = .{};
+        if (meta.option("buildflags")) |v| f.buildflags = v;
+        if (meta.option("lto")) |v| f.lto = v;
+        if (meta.option("debug")) |v| f.debug = v;
+        return f;
+    }
+};
+
+const lto_flag = " -flto=auto";
+const debug_flag = " -g";
+
 /// Populate the environment contract a PKGBUILD expects to see.
 fn populateEnv(
     gpa: std.mem.Allocator,
@@ -186,18 +245,37 @@ fn populateEnv(
 
     try env.put("CARCH", c.carch);
     try env.put("CHOST", c.chost);
-    try env.put("CFLAGS", c.cflags);
-    try env.put("CXXFLAGS", c.cxxflags);
     try env.put("MAKEFLAGS", c.makeflags);
     try env.put("PACKAGER", c.packager);
 
-    if (c.store_rpath) |rpath| {
-        const ldflags = try std.fmt.allocPrint(gpa, "{s} -Wl,-rpath,{s}", .{ c.ldflags, rpath });
-        defer gpa.free(ldflags);
-        try env.put("LDFLAGS", ldflags);
-    } else {
-        try env.put("LDFLAGS", c.ldflags);
+    // `!buildflags` means the PKGBUILD wants a clean compiler environment.
+    if (!ctx.flags.buildflags) {
+        try env.put("CFLAGS", "");
+        try env.put("CXXFLAGS", "");
+        try env.put("LDFLAGS", "");
+        return;
     }
+
+    const extra = try std.fmt.allocPrint(gpa, "{s}{s}", .{
+        if (ctx.flags.lto) lto_flag else "",
+        if (ctx.flags.debug) debug_flag else "",
+    });
+    defer gpa.free(extra);
+
+    const cflags = try std.fmt.allocPrint(gpa, "{s}{s}", .{ c.cflags, extra });
+    defer gpa.free(cflags);
+    try env.put("CFLAGS", cflags);
+
+    const cxxflags = try std.fmt.allocPrint(gpa, "{s}{s}", .{ c.cxxflags, extra });
+    defer gpa.free(cxxflags);
+    try env.put("CXXFLAGS", cxxflags);
+
+    const ldflags = if (c.store_rpath) |rpath|
+        try std.fmt.allocPrint(gpa, "{s}{s} -Wl,-rpath,{s}", .{ c.ldflags, if (ctx.flags.lto) lto_flag else "", rpath })
+    else
+        try std.fmt.allocPrint(gpa, "{s}{s}", .{ c.ldflags, if (ctx.flags.lto) lto_flag else "" });
+    defer gpa.free(ldflags);
+    try env.put("LDFLAGS", ldflags);
 }
 
 /// Host values detected at build time, replacing makepkg.conf's hardcoded
@@ -289,6 +367,30 @@ test "only package is mandatory" {
 test "fakeroot is confined to package" {
     try testing.expect(Stage.package.needsFakeroot());
     try testing.expect(!Stage.build.needsFakeroot());
+}
+
+test "build flags follow options" {
+    const srcinfo = @import("srcinfo.zig");
+
+    const off = "pkgbase = x\n\toptions = !buildflags\n";
+    var a = try srcinfo.parse(std.testing.allocator, off, "x86_64");
+    defer a.deinit();
+    try testing.expect(!Flags.fromOptions(&a).buildflags);
+
+    const on = "pkgbase = x\n\toptions = lto\n\toptions = debug\n";
+    var b = try srcinfo.parse(std.testing.allocator, on, "x86_64");
+    defer b.deinit();
+    const f = Flags.fromOptions(&b);
+    try testing.expect(f.lto);
+    try testing.expect(f.debug);
+    try testing.expect(f.buildflags);
+}
+
+test "lto and debug default off" {
+    const f: Flags = .{};
+    try testing.expect(f.buildflags);
+    try testing.expect(!f.lto);
+    try testing.expect(!f.debug);
 }
 
 test "stage names match PKGBUILD function names" {

@@ -30,7 +30,7 @@ printf 'pkgbase = hello\n\tpkgdesc = Prints a friendly greeting\n\tpkgver = 2.12
 echo "=== build ==="
 $OPTI build "$WORK" 2>&1 | grep -vE '^(config|Making|installing|/bin/sh|make|  GEN|warning)' | tail -12
 
-PKG=$(ls "$WORK"/*.pkg.tar.gz)
+PKG=$(ls "$WORK"/*.pkg.tar.*)
 echo
 echo "=== artifact ==="
 ls -lh "$PKG" | awk '{print $5, $9}'
@@ -38,23 +38,23 @@ file "$PKG"
 
 echo
 echo "=== member order (metadata must come first) ==="
-tar tzf "$PKG" | head -5
+tar tf "$PKG" | head -5
 
 echo
 echo "=== .PKGINFO ==="
-tar xzOf "$PKG" .PKGINFO
+tar xOf "$PKG" .PKGINFO
 
 echo "=== .MTREE is gzipped ==="
-tar xzOf "$PKG" .MTREE | head -c2 | xxd | head -1
+tar xOf "$PKG" .MTREE | head -c2 | xxd | head -1
 echo "--- decoded head ---"
-tar xzOf "$PKG" .MTREE | gzip -d | head -4
+tar xOf "$PKG" .MTREE | gzip -d | head -4
 
 echo
 echo "=== executable bit preserved ==="
-tar tvzf "$PKG" | grep 'usr/bin/hello'
+tar tvf "$PKG" | grep 'usr/bin/hello'
 
 echo
 echo "=== extract and run from the package ==="
 rm -rf /var/tmp/opti-verify; mkdir -p /var/tmp/opti-verify
-tar xzf "$PKG" -C /var/tmp/opti-verify
+tar xf "$PKG" -C /var/tmp/opti-verify
 /var/tmp/opti-verify/usr/bin/hello

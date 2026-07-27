@@ -1,0 +1,46 @@
+# optimkp.toml — opti's equivalent of makepkg.conf
+#
+# Copy to one of, most specific first:
+#   <pkgbuild dir>/optimkp.toml            per-package
+#   ~/.config/opti/optimkp.toml            per-user
+#   /etc/opti/optimkp.toml                 machine-wide
+#
+# The first file found wins outright; settings are not merged across files.
+# Anything omitted keeps its built-in default, which is detected from the host
+# where possible — so an empty file behaves exactly like no file at all.
+
+[build]
+# Compiler flags. Omit to use opti's defaults.
+cflags   = "-O2 -pipe -fno-plt -fexceptions"
+cxxflags = "-O2 -pipe -fno-plt -fexceptions"
+ldflags  = "-Wl,-O1 -Wl,--sort-common -Wl,--as-needed"
+
+# Omit to use one job per detected CPU.
+# makeflags = "-j8"
+
+# Omit to detect via `uname -m` and `gcc -dumpmachine`.
+# carch = "x86_64"
+# chost = "x86_64-pc-linux-gnu"
+
+packager = "Your Name <you@example.com>"
+
+[package]
+# zstd | gzip | none.  zstd needs the `zstd` binary; opti falls back to gzip
+# when it is missing, which is an equally valid PKGEXT.
+compression = "zstd"
+
+# zstd level. 19 matches Arch. Lowering this mainly saves memory in the zstd
+# process — opti's own footprint stays near 10 MB regardless of package size.
+compression_level = 19
+
+# Defaults for options=() a PKGBUILD does not specify itself. A PKGBUILD's own
+# options=() always wins over anything set here.
+[options]
+strip      = true
+docs       = true
+zipman     = true
+purge      = true
+libtool    = false
+staticlibs = false
+emptydirs  = false
+debug      = false

@@ -31,6 +31,39 @@ pub fn writeFile(io: std.Io, absolute_path: []const u8, data: []const u8) !void 
     return Dir.cwd().writeFile(io, .{ .sub_path = absolute_path, .data = data });
 }
 
+/// Recursively copy the contents of `src` into `dest`, creating `dest`.
+pub fn copyTree(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    dest: []const u8,
+) !void {
+    var src_dir = try Dir.cwd().openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
+
+    try makePath(io, dest);
+    var dest_dir = try Dir.cwd().openDir(io, dest, .{});
+    defer dest_dir.close(io);
+
+    var walker = try src_dir.walk(gpa);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => dest_dir.createDirPath(io, entry.path) catch {},
+            .file => {
+                // Parent directories are visited before their contents, but a
+                // walk order is not guaranteed, so ensure it exists.
+                if (std.fs.path.dirname(entry.path)) |parent| {
+                    dest_dir.createDirPath(io, parent) catch {};
+                }
+                src_dir.copyFile(entry.path, dest_dir, entry.path, io, .{}) catch {};
+            },
+            else => {},
+        }
+    }
+}
+
 /// Read an entire file. Caller owns the result.
 pub fn readFile(
     io: std.Io,

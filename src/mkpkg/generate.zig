@@ -24,7 +24,40 @@ const array_keys =
     "provides conflicts replaces options source noextract backup validpgpkeys " ++
     "md5sums sha1sums sha224sums sha256sums sha384sums sha512sums b2sums";
 
-const script =
+/// Variables a split package may override inside its `package_<name>()` body.
+const override_scalars = "pkgdesc url install changelog";
+const override_arrays =
+    "groups license depends optdepends provides conflicts replaces backup options";
+
+/// Pull variable assignments out of a function body.
+///
+/// Split PKGBUILDs declare per-package metadata *inside* `package_<name>()`,
+/// so it cannot be read by sourcing the file alone. `declare -f` prints the
+/// body; this scans it for assignments to the known variables and tracks
+/// parenthesis depth so multi-line array literals are captured whole.
+const extract_fn =
+    \\extract_pkg_vars() {
+    \\  declare -f "$1" 2>/dev/null | awk '
+    \\    BEGIN { grab = 0; depth = 0 }
+    \\    {
+    \\      line = $0
+    \\      if (!grab && match(line, /^[ \t]*(pkgdesc|url|install|changelog|groups|license|depends|optdepends|provides|conflicts|replaces|backup|options)\+?=/)) {
+    \\        grab = 1; depth = 0
+    \\      }
+    \\      if (grab) {
+    \\        print line
+    \\        tmp = line
+    \\        opens = gsub(/\(/, "(", tmp)
+    \\        closes = gsub(/\)/, ")", tmp)
+    \\        depth += opens - closes
+    \\        if (depth <= 0) grab = 0
+    \\      }
+    \\    }'
+    \\}
+;
+
+const script = extract_fn ++
+    \\
     \\set -e
     \\source "$OPTI_PKGBUILD"
     \\{
@@ -42,15 +75,31 @@ const script =
     \\  done
     \\  for p in "${pkgname[@]}"; do
     \\    printf '\npkgname = %s\n' "$p"
+    \\    (
+    \\      # A subshell with the inherited values cleared, so only what the
+    \\      # package function itself sets is emitted as an override.
+    \\      unset $OPTI_OVERRIDE_SCALARS $OPTI_OVERRIDE_ARRAYS
+    \\      vars="$(extract_pkg_vars "package_$p")"
+    \\      [ -n "$vars" ] && eval "$vars"
+    \\      for k in $OPTI_OVERRIDE_SCALARS; do
+    \\        v="${!k}"
+    \\        [ -n "$v" ] && printf '\t%s = %s\n' "$k" "$v"
+    \\      done
+    \\      for k in $OPTI_OVERRIDE_ARRAYS; do
+    \\        eval "items=(\"\${$k[@]}\")"
+    \\        for item in "${items[@]}"; do
+    \\          [ -n "$item" ] && printf '\t%s = %s\n' "$k" "$item"
+    \\        done
+    \\      done
+    \\    )
     \\  done
     \\} > "$OPTI_SRCINFO_OUT"
 ;
 
 /// Produce `.SRCINFO` text for `pkgbuild`. Caller owns the result.
 ///
-/// Split packages declare their per-package overrides *inside* their
-/// `package_<name>()` bodies, which are not evaluated here; those still apply
-/// at build time but are not reflected in the generated metadata.
+/// Split-package overrides declared inside `package_<name>()` bodies are
+/// extracted too, so the generated metadata matches what the build produces.
 pub fn fromPkgbuild(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -65,6 +114,8 @@ pub fn fromPkgbuild(
     try env.put("OPTI_SRCINFO_OUT", out_path);
     try env.put("OPTI_SCALARS", scalar_keys);
     try env.put("OPTI_ARRAYS", array_keys);
+    try env.put("OPTI_OVERRIDE_SCALARS", override_scalars);
+    try env.put("OPTI_OVERRIDE_ARRAYS", override_arrays);
 
     const status = try exec.run(io, &.{ "bash", "-c", script }, .{
         .cwd = workdir,

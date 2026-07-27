@@ -14,6 +14,7 @@ const verify = @import("verify.zig");
 const fetch = @import("fetch.zig");
 const extract = @import("extract.zig");
 const signature = @import("signature.zig");
+const exec = @import("exec.zig");
 const git = @import("../install/get.zig");
 
 pub const Error = error{
@@ -46,8 +47,9 @@ pub fn acquire(
     meta: *const srcinfo.SrcInfo,
     startdir: []const u8,
     srcdir: []const u8,
+    skip_checksums: bool,
 ) !void {
-    const sums = meta.strongestChecksums();
+    const sums = if (skip_checksums) null else meta.strongestChecksums();
 
     for (meta.sources, 0..) |source, index| {
         const name = localName(source);
@@ -127,14 +129,19 @@ fn verifySignatures(
 
         if (!io.exists(io_ctx, target_path)) continue;
 
-        _ = signature.verifyDetached(io_ctx, sig_path, target_path) catch |err| {
-            try out.print("  {s}: signature {s}\n", .{
-                name,
-                if (err == signature.Error.VerifierUnavailable)
-                    "UNVERIFIABLE (gpg not installed)"
-                else
-                    "INVALID",
-            });
+        _ = signature.verifyDetached(
+            gpa,
+            io_ctx,
+            sig_path,
+            target_path,
+            meta.validpgpkeys,
+            startdir,
+        ) catch |err| {
+            try out.print("  {s}: signature {s}\n", .{ name, switch (err) {
+                signature.Error.VerifierUnavailable => "UNVERIFIABLE (gpg not installed)",
+                signature.Error.UntrustedKey => "signed by a key not in validpgpkeys",
+                else => "INVALID",
+            } });
             return err;
         };
         try out.print("  {s}: signature ok\n", .{name});
@@ -171,8 +178,11 @@ fn obtain(
     return data;
 }
 
-/// Clone a `git+`/`svn+`/`hg+`/`bzr+` source. Only git is implemented; the
-/// others are rare enough that failing loudly beats a silent wrong build.
+/// Clone a `git+`/`svn+`/`hg+`/`bzr+` source.
+///
+/// git uses libgit2 directly. The others delegate to their own clients, which
+/// have no library binding here and are only needed by the small number of
+/// PKGBUILDs that use them.
 fn acquireVcs(
     gpa: std.mem.Allocator,
     io_ctx: std.Io,
@@ -182,22 +192,99 @@ fn acquireVcs(
     name: []const u8,
     srcdir: []const u8,
 ) !void {
-    if (!std.mem.eql(u8, scheme, "git")) return Error.UnsupportedSource;
+    if (!std.mem.eql(u8, scheme, "git")) {
+        return acquireOtherVcs(gpa, io_ctx, out, scheme, source, name, srcdir);
+    }
 
     const dest = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ srcdir, name }, 0);
     defer gpa.free(dest);
 
-    if (io.exists(io_ctx, dest)) {
+    if (!io.exists(io_ctx, dest)) {
+        const url = try gpa.dupeZ(u8, source.location);
+        defer gpa.free(url);
+
+        try out.print("  {s}: cloning\n", .{name});
+        try out.flush();
+        try git.cloneToDir(url, dest, out);
+    } else {
         try out.print("  {s}: already cloned\n", .{name});
+    }
+
+    // A pinned revision must be checked out, or the build silently uses
+    // whatever the default branch currently points at.
+    if (source.fragment) |frag| {
+        const rev = try gpa.dupeZ(u8, frag.value);
+        defer gpa.free(rev);
+
+        try git.checkoutRef(dest, rev, out);
+        try out.print("  {s}: checked out {s}={s}\n", .{ name, frag.kind, frag.value });
+    }
+}
+
+/// Subversion, Mercurial and Bazaar sources, via their own clients.
+fn acquireOtherVcs(
+    gpa: std.mem.Allocator,
+    io_ctx: std.Io,
+    out: *std.Io.Writer,
+    scheme: []const u8,
+    source: srcinfo.Source,
+    name: []const u8,
+    srcdir: []const u8,
+) !void {
+    const tool: []const u8 = if (std.mem.eql(u8, scheme, "svn"))
+        "svn"
+    else if (std.mem.eql(u8, scheme, "hg"))
+        "hg"
+    else if (std.mem.eql(u8, scheme, "bzr"))
+        "bzr"
+    else
+        return Error.UnsupportedSource;
+
+    if (!exec.exists(io_ctx, tool)) {
+        try out.print("  {s}: {s} client not installed\n", .{ name, tool });
+        return Error.UnsupportedSource;
+    }
+
+    const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ srcdir, name });
+    defer gpa.free(dest);
+
+    if (io.exists(io_ctx, dest)) {
+        try out.print("  {s}: already checked out\n", .{name});
         return;
     }
 
-    const url = try gpa.dupeZ(u8, source.location);
-    defer gpa.free(url);
-
-    try out.print("  {s}: cloning\n", .{name});
+    try out.print("  {s}: fetching via {s}\n", .{ name, tool });
     try out.flush();
-    try git.cloneToDir(url, dest, out);
+
+    // Each client spells "check out into this directory" differently, and each
+    // pins a revision with its own flag.
+    const rev = if (source.fragment) |f| f.value else null;
+
+    if (std.mem.eql(u8, tool, "svn")) {
+        if (rev) |r| {
+            const spec = try std.fmt.allocPrint(gpa, "-r{s}", .{r});
+            defer gpa.free(spec);
+            try exec.check(io_ctx, &.{ "svn", "checkout", spec, source.location, dest }, .{});
+        } else {
+            try exec.check(io_ctx, &.{ "svn", "checkout", source.location, dest }, .{});
+        }
+    } else if (std.mem.eql(u8, tool, "hg")) {
+        if (rev) |r| {
+            try exec.check(io_ctx, &.{ "hg", "clone", "-u", r, source.location, dest }, .{});
+        } else {
+            try exec.check(io_ctx, &.{ "hg", "clone", source.location, dest }, .{});
+        }
+    } else {
+        if (rev) |r| {
+            const spec = try std.fmt.allocPrint(gpa, "-r{s}", .{r});
+            defer gpa.free(spec);
+            try exec.check(io_ctx, &.{ "bzr", "branch", spec, source.location, dest }, .{});
+        } else {
+            try exec.check(io_ctx, &.{ "bzr", "branch", source.location, dest }, .{});
+        }
+    }
+
+    if (rev) |r| try out.print("  {s}: pinned to {s}\n", .{ name, r });
 }
 
 const testing = std.testing;

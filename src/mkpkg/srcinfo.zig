@@ -24,13 +24,22 @@ pub const ChecksumSet = struct {
     values: []const []const u8,
 };
 
+/// The `#tag=`/`#commit=`/`#branch=` suffix pinning a VCS source to a
+/// revision. Ignoring it would silently build whatever the default branch
+/// happens to point at.
+pub const Fragment = struct {
+    kind: []const u8,
+    value: []const u8,
+};
+
 pub const Source = struct {
     /// Local filename from the `name::url` form, when present.
     rename: ?[]const u8 = null,
-    /// Location with any VCS prefix removed.
+    /// Location with any VCS prefix and `#fragment` removed.
     location: []const u8,
     /// VCS scheme from a `git+`/`svn+`/`hg+`/`bzr+` prefix.
     vcs: ?[]const u8 = null,
+    fragment: ?Fragment = null,
 };
 
 /// One output package. A non-split PKGBUILD produces exactly one of these.
@@ -47,6 +56,9 @@ pub const Package = struct {
     licenses: []const []const u8 = &.{},
     /// Config files pacman preserves across upgrades.
     backup: []const []const u8 = &.{},
+    /// `name: reason` entries, stored verbatim.
+    optdepends: []const []const u8 = &.{},
+    groups: []const []const u8 = &.{},
 };
 
 pub const SrcInfo = struct {
@@ -67,12 +79,21 @@ pub const SrcInfo = struct {
     conflicts: []const Dep = &.{},
     replaces: []const Dep = &.{},
 
+    /// `arch=()` as declared. A lone `any` marks the package as
+    /// architecture-independent, which changes both the artifact filename and
+    /// the recorded arch.
+    arches: []const []const u8 = &.{},
+    changelog: ?[]const u8 = null,
+
     sources: []const Source = &.{},
     checksums: []const ChecksumSet = &.{},
     /// `options=()` entries, `!` prefix retained (e.g. `!lto`).
     options: []const []const u8 = &.{},
     /// Sources listed in `noextract=()`, left packed in $srcdir.
     noextract: []const []const u8 = &.{},
+    /// Fingerprints permitted to sign this package's sources. An empty list
+    /// means any key gpg already trusts is accepted.
+    validpgpkeys: []const []const u8 = &.{},
 
     /// Output packages, always at least one.
     packages: []const Package = &.{},
@@ -92,6 +113,20 @@ pub const SrcInfo = struct {
             }
         }
         return best;
+    }
+
+    /// Architecture-independent packages declare `arch=('any')` and are stamped
+    /// `any` rather than the build host's architecture.
+    pub fn isAny(self: SrcInfo) bool {
+        for (self.arches) |a| {
+            if (std.mem.eql(u8, a, "any")) return true;
+        }
+        return false;
+    }
+
+    /// The architecture to record and to put in the artifact filename.
+    pub fn archFor(self: SrcInfo, host_arch: []const u8) []const u8 {
+        return if (self.isAny()) "any" else host_arch;
     }
 
     /// Whether `options` contains `name` (as `name`), or its negation `!name`.
@@ -127,6 +162,8 @@ const Section = struct {
     replaces: std.ArrayList(Dep) = .empty,
     licenses: std.ArrayList([]const u8) = .empty,
     backup: std.ArrayList([]const u8) = .empty,
+    optdepends: std.ArrayList([]const u8) = .empty,
+    groups: std.ArrayList([]const u8) = .empty,
 };
 
 /// Parse `text`, keeping only entries applicable to `arch`. The result owns
@@ -144,11 +181,14 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, arch: []const u8) !SrcInf
     var pkgrel: []const u8 = "";
     var epoch: ?[]const u8 = null;
 
+    var changelog: ?[]const u8 = null;
+    var arches: std.ArrayList([]const u8) = .empty;
     var makedepends: std.ArrayList(Dep) = .empty;
     var checkdepends: std.ArrayList(Dep) = .empty;
     var sources: std.ArrayList(Source) = .empty;
     var options: std.ArrayList([]const u8) = .empty;
     var noextract: std.ArrayList([]const u8) = .empty;
+    var validpgpkeys: std.ArrayList([]const u8) = .empty;
 
     const algorithm_count = @typeInfo(verify.Algorithm).@"enum".fields.len;
     var sums: [algorithm_count]std.ArrayList([]const u8) = @splat(.empty);
@@ -190,6 +230,10 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, arch: []const u8) !SrcInf
             try current.licenses.append(a, try a.dupe(u8, value));
         } else if (std.mem.eql(u8, key, "backup")) {
             try current.backup.append(a, try a.dupe(u8, value));
+        } else if (matches(key, "optdepends", arch)) {
+            try current.optdepends.append(a, try a.dupe(u8, value));
+        } else if (std.mem.eql(u8, key, "groups")) {
+            try current.groups.append(a, try a.dupe(u8, value));
         } else if (matches(key, "depends", arch)) {
             try current.depends.append(a, Dep.parse(try a.dupe(u8, value)));
         } else if (matches(key, "provides", arch)) {
@@ -207,10 +251,16 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, arch: []const u8) !SrcInf
             pkgrel = try a.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "epoch")) {
             epoch = try a.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "arch")) {
+            try arches.append(a, try a.dupe(u8, value));
+        } else if (std.mem.eql(u8, key, "changelog")) {
+            changelog = try a.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "options")) {
             try options.append(a, try a.dupe(u8, value));
         } else if (std.mem.eql(u8, key, "noextract")) {
             try noextract.append(a, try a.dupe(u8, value));
+        } else if (std.mem.eql(u8, key, "validpgpkeys")) {
+            try validpgpkeys.append(a, try a.dupe(u8, value));
         } else if (matches(key, "makedepends", arch)) {
             try makedepends.append(a, Dep.parse(try a.dupe(u8, value)));
         } else if (matches(key, "checkdepends", arch)) {
@@ -254,6 +304,8 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, arch: []const u8) !SrcInf
     const out_checksums = try checksums.toOwnedSlice(a);
     const out_options = try options.toOwnedSlice(a);
     const out_noextract = try noextract.toOwnedSlice(a);
+    const out_arches = try arches.toOwnedSlice(a);
+    const out_validpgpkeys = try validpgpkeys.toOwnedSlice(a);
     const out_packages = try packages.toOwnedSlice(a);
 
     return .{
@@ -271,10 +323,13 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, arch: []const u8) !SrcInf
         .provides = out_base_provides,
         .conflicts = out_base_conflicts,
         .replaces = out_base_replaces,
+        .arches = out_arches,
+        .changelog = changelog,
         .sources = out_sources,
         .checksums = out_checksums,
         .options = out_options,
         .noextract = out_noextract,
+        .validpgpkeys = out_validpgpkeys,
         .packages = out_packages,
     };
 }
@@ -294,6 +349,8 @@ fn finalize(a: std.mem.Allocator, s: *Section, base: *const Section) !Package {
         .replaces = try inherit(a, &s.replaces, base.replaces.items),
         .licenses = try inheritStrings(a, &s.licenses, base.licenses.items),
         .backup = try inheritStrings(a, &s.backup, base.backup.items),
+        .optdepends = try inheritStrings(a, &s.optdepends, base.optdepends.items),
+        .groups = try inheritStrings(a, &s.groups, base.groups.items),
     };
 }
 
@@ -360,10 +417,27 @@ fn parseSource(a: std.mem.Allocator, value: []const u8) !Source {
         }
     }
 
+    // The fragment is only meaningful for VCS sources; a '#' in a plain URL is
+    // part of the URL.
+    var fragment: ?Fragment = null;
+    if (vcs != null) {
+        if (std.mem.indexOfScalar(u8, location, '#')) |hash| {
+            const spec = location[hash + 1 ..];
+            location = location[0..hash];
+            if (std.mem.indexOfScalar(u8, spec, '=')) |eq| {
+                fragment = .{
+                    .kind = try a.dupe(u8, spec[0..eq]),
+                    .value = try a.dupe(u8, spec[eq + 1 ..]),
+                };
+            }
+        }
+    }
+
     return .{
         .rename = rename,
         .location = try a.dupe(u8, location),
         .vcs = vcs,
+        .fragment = fragment,
     };
 }
 
@@ -604,6 +678,70 @@ test "positive options are detected" {
 
     try testing.expectEqual(@as(?bool, true), si.option("strip"));
     try testing.expectEqual(@as(?bool, false), si.option("docs"));
+}
+
+test "arch any is detected and overrides the host arch" {
+    const text = "pkgbase = fonts\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n";
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+
+    try testing.expect(si.isAny());
+    try testing.expectEqualStrings("any", si.archFor("x86_64"));
+}
+
+test "concrete arch is kept" {
+    const text = "pkgbase = tool\n\tarch = x86_64\n\tarch = aarch64\n";
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+
+    try testing.expect(!si.isAny());
+    try testing.expectEqualStrings("x86_64", si.archFor("x86_64"));
+}
+
+test "vcs fragment pins a revision" {
+    const text = "pkgbase = thing\n\tsource = thing::git+https://example.com/r.git#tag=v1.2.3\n";
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+
+    const s = si.sources[0];
+    try testing.expectEqualStrings("git", s.vcs.?);
+    // The fragment must not remain part of the clone URL.
+    try testing.expectEqualStrings("https://example.com/r.git", s.location);
+    try testing.expectEqualStrings("tag", s.fragment.?.kind);
+    try testing.expectEqualStrings("v1.2.3", s.fragment.?.value);
+}
+
+test "commit and branch fragments" {
+    const text = "pkgbase = t\n\tsource = git+https://e.com/r.git#commit=abc123\n";
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+    try testing.expectEqualStrings("commit", si.sources[0].fragment.?.kind);
+    try testing.expectEqualStrings("abc123", si.sources[0].fragment.?.value);
+}
+
+test "a hash in a plain url is not a fragment" {
+    const text = "pkgbase = t\n\tsource = https://example.com/file.tar.gz#anchor\n";
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+
+    try testing.expectEqual(@as(?Fragment, null), si.sources[0].fragment);
+    try testing.expectEqualStrings("https://example.com/file.tar.gz#anchor", si.sources[0].location);
+}
+
+test "optdepends and groups reach the package" {
+    const text =
+        \\pkgbase = app
+        \\  optdepends = sudo: privilege elevation
+        \\  groups = base-devel
+        \\
+        \\pkgname = app
+        \\
+    ;
+    var si = try parse(testing.allocator, text, "x86_64");
+    defer si.deinit();
+
+    try testing.expectEqualStrings("sudo: privilege elevation", si.packages[0].optdepends[0]);
+    try testing.expectEqualStrings("base-devel", si.packages[0].groups[0]);
 }
 
 test "install scriptlet and backup files" {

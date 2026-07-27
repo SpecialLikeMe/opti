@@ -22,6 +22,8 @@ pub const archive = @import("archive.zig");
 pub const tidy = @import("tidy.zig");
 pub const generate = @import("generate.zig");
 pub const signature = @import("signature.zig");
+pub const toml = @import("toml.zig");
+pub const config = @import("config.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const driver = @import("driver.zig");
 
@@ -45,6 +47,8 @@ test {
     _ = tidy;
     _ = generate;
     _ = signature;
+    _ = toml;
+    _ = config;
     _ = lifecycle;
     _ = driver;
 }

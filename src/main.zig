@@ -16,6 +16,11 @@ const usage =
     \\  build <directory>     run the build lifecycle on a PKGBUILD directory
     \\  version               print the opti version
     \\
+    \\build options:
+    \\  --nocheck             skip check()
+    \\  --skipchecksums       do not validate source checksums
+    \\  --holdver             do not run pkgver()
+    \\
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -61,11 +66,29 @@ fn dispatch(init: std.process.Init, out: *std.Io.Writer) !bool {
         },
         .uninstall => try out.writeAll("uninstall: not implemented yet\n"),
         .build => {
-            if (args.len < 3) {
+            var dir: ?[]const u8 = null;
+            var opts: mkpkg.driver.BuildOptions = .{};
+
+            for (args[2..]) |arg| {
+                if (std.mem.eql(u8, arg, "--nocheck")) {
+                    opts.skip_check = true;
+                } else if (std.mem.eql(u8, arg, "--skipchecksums")) {
+                    opts.skip_checksums = true;
+                } else if (std.mem.eql(u8, arg, "--holdver")) {
+                    opts.hold_version = true;
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    try out.print("build: unknown option {s}\n", .{arg});
+                    return false;
+                } else {
+                    dir = arg;
+                }
+            }
+
+            const target = dir orelse {
                 try out.writeAll("build: expected a PKGBUILD directory\n");
                 return false;
-            }
-            try mkpkg.driver.build(init.gpa, init.io, init.environ_map, out, args[2], .{});
+            };
+            try mkpkg.driver.build(init.gpa, init.io, init.environ_map, out, target, .{}, opts);
         },
         .version => try out.print("opti {s}\n", .{version}),
     }

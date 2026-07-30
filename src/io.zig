@@ -10,9 +10,14 @@ pub const Writer = std.Io.Writer;
 pub const File = std.Io.File;
 pub const Dir = std.Io.Dir;
 
-/// Whether `absolute_path` exists and is reachable.
-pub fn exists(io: std.Io, absolute_path: []const u8) bool {
-    Dir.accessAbsolute(io, absolute_path, .{}) catch return false;
+/// Whether `path` exists and is reachable. Relative paths resolve against the
+/// current directory.
+///
+/// Resolved through `cwd()` rather than `accessAbsolute`, which asserts its
+/// argument is absolute and so panics on a relative path instead of simply
+/// reporting that it does not exist.
+pub fn exists(io: std.Io, path: []const u8) bool {
+    Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
 
@@ -83,4 +88,19 @@ pub fn stdout(io: std.Io, buffer: []u8) File.Writer {
 /// Buffered stderr. Same lifetime rules as `stdout`.
 pub fn stderr(io: std.Io, buffer: []u8) File.Writer {
     return File.stderr().writer(io, buffer);
+}
+
+/// Ask a yes/no question. Defaults to no on EOF or anything unrecognised, so a
+/// non-interactive run never proceeds by accident.
+pub fn confirm(io: std.Io, out: *Writer, question: []const u8) bool {
+    out.print("{s} [y/N] ", .{question}) catch return false;
+    out.flush() catch return false;
+
+    var buf: [64]u8 = undefined;
+    var reader = File.stdin().reader(io, &buf);
+
+    const line = reader.interface.takeDelimiterExclusive('\n') catch return false;
+    const answer = std.mem.trim(u8, line, " \t\r");
+
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }

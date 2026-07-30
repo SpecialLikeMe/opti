@@ -23,6 +23,10 @@ pub const BuildOptions = struct {
     skip_checksums: bool = false,
     /// `--holdver`: do not run `pkgver()`, keeping the declared version.
     hold_version: bool = false,
+    /// Shared library directory to bake into RPATH. When set, source builds
+    /// resolve their runtime dependencies from the store instead of relying on
+    /// the host's library search path.
+    store_lib_dir: ?[]const u8 = null,
 };
 
 /// Layout of a build work tree, mirroring makepkg's.
@@ -57,7 +61,7 @@ pub fn build(
     startdir: []const u8,
     config_in: lifecycle.Config,
     build_opts: BuildOptions,
-) !void {
+) ![][]const u8 {
     const pre = lifecycle.preflight(io_ctx);
     if (!pre.ok()) {
         try out.writeAll("missing required build tools:");
@@ -82,6 +86,8 @@ pub fn build(
     var user_config = try conf.load(gpa, io_ctx, env, startdir);
     defer user_config.deinit();
     user_config.applyTo(&config);
+    // Baked into LDFLAGS so relocated binaries can still find store libraries.
+    if (build_opts.store_lib_dir) |dir| config.store_rpath = dir;
     if (user_config.found()) {
         try out.print("using {s}\n", .{user_config.source_path});
     }
@@ -177,12 +183,22 @@ pub fn build(
     const compression = user_config.compression orelse archive.Compression.preferred(io_ctx);
     const level = user_config.compression_level orelse conf.default_level;
 
+    // Paths of every artifact produced, so the caller can install them.
+    var artifacts: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (artifacts.items) |a| gpa.free(a);
+        artifacts.deinit(gpa);
+    }
+
     for (meta.packages) |pkg| {
         try packageOne(
             gpa,   io_ctx, env,     out,  &meta, pkg,
             layout, &ctx,  version, config, opts, compression, level,
+            &artifacts,
         );
     }
+
+    return artifacts.toOwnedSlice(gpa);
 }
 
 /// Stage, tidy and archive a single output package.
@@ -200,6 +216,7 @@ fn packageOne(
     opts: tidy.Options,
     compression: archive.Compression,
     level: u8,
+    artifacts: *std.ArrayList([]const u8),
 ) !void {
     const pkgdir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ layout.pkgbase_dir, pkg.pkgname });
     defer gpa.free(pkgdir);
@@ -262,7 +279,7 @@ fn packageOne(
         meta.archFor(config.carch),
         compression.extension(),
     });
-    defer gpa.free(out_path);
+    errdefer gpa.free(out_path);
 
     const written = try archive.write(gpa, io_ctx, pkgdir, .{
         .pkgname = pkg.pkgname,
@@ -288,6 +305,7 @@ fn packageOne(
 
     try out.print("built {s} ({d} bytes)\n", .{ out_path, written });
     try out.flush();
+    try artifacts.append(gpa, out_path);
 
     // makepkg's debug packages carry the sources the symbols refer to, so a
     // debugger can show source lines and not just function names.
@@ -304,7 +322,7 @@ fn packageOne(
     if (opts.debug and report.detached > 0) {
         try emitDebugPackage(
             gpa,       io_ctx,  out,     meta, pkg,
-            debug_dir, version, config,  compression, level, layout,
+            debug_dir, version, config,  compression, level, layout, artifacts,
         );
     }
 }
@@ -322,6 +340,7 @@ fn emitDebugPackage(
     compression: archive.Compression,
     level: u8,
     layout: Layout,
+    artifacts: *std.ArrayList([]const u8),
 ) !void {
     const name = try std.fmt.allocPrint(gpa, "{s}-debug", .{pkg.pkgname});
     defer gpa.free(name);
@@ -336,7 +355,7 @@ fn emitDebugPackage(
         meta.archFor(config.carch),
         compression.extension(),
     });
-    defer gpa.free(path);
+    errdefer gpa.free(path);
 
     const written = try archive.write(gpa, io_ctx, debug_dir, .{
         .pkgname = name,
@@ -353,4 +372,5 @@ fn emitDebugPackage(
 
     try out.print("built {s} ({d} bytes)\n", .{ path, written });
     try out.flush();
+    try artifacts.append(gpa, path);
 }

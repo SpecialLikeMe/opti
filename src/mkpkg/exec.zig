@@ -52,6 +52,12 @@ pub fn exists(io: std.Io, name: []const u8) bool {
 /// Output is routed through a file rather than a pipe: `std.process.spawn`
 /// exposes no capture mode, and a file avoids any risk of deadlocking on a
 /// full pipe buffer. `tmp_path` must not contain a single quote.
+/// Generous enough for `ldconfig -p`, which runs to roughly 100 KB on a
+/// developer machine. A tight limit here fails with `StreamTooLong` and, since
+/// callers treat a capture failure as "no output", silently disables whatever
+/// depended on it.
+const capture_limit = 4 * 1024 * 1024;
+
 pub fn capture(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -63,7 +69,7 @@ pub fn capture(
 
     try check(io, &.{ "sh", "-c", script }, .{});
 
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, gpa, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, tmp_path, gpa, .limited(capture_limit));
     defer gpa.free(raw);
     std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 

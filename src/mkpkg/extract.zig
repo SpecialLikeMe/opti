@@ -61,6 +61,12 @@ fn normalizeTimestamps(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !voi
     defer walker.deinit();
 
     while (try walker.next(io)) |entry| {
+        // setTimestamps follows symlinks and there is no no-follow option, so
+        // a link pointing outside the tree (an absolute target, say) would
+        // fail with ENOENT and dump a trace. Their timestamps do not matter
+        // for build ordering anyway.
+        if (entry.kind == .sym_link) continue;
+
         // Best effort: a file we cannot stamp is not worth failing the build.
         entry.dir.setTimestamps(io, entry.basename, .{
             .access_timestamp = .{ .new = uniform_mtime },
